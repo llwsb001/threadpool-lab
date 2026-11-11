@@ -7,7 +7,7 @@
 
 ```bash
 zig build run                  # 编译并运行 demo
-bash scripts/observe.sh        # 用 /proc 采样观察线程数变化
+bash scripts/observe.sh        # 用 /proc 采样观察线程数变化（二进制缺失时自动 zig build）
 ```
 
 ## 结构
@@ -37,7 +37,7 @@ submit()                ┌─────────────────�
 
 | 代码 | 0.17 设施 | Linux 底层 |
 |---|---|---|
-| `std.Thread.spawn` | 线程创建 | pthread_create → `clone` |
+| `std.Thread.spawn` | 线程创建 | 本项目未链接 libc：`LinuxThreadImpl` 直接发 `clone`；链接 libc 的构建才经 pthread_create → `clone` |
 | `mutex.lock/unlock` | `std.Io.Mutex` | 快路径 CAS（无 syscall）；争用后 `futex` |
 | `cond.wait/signal` | `std.Io.Condition` | `futex(FUTEX_WAIT/WAKE)` |
 | `Io.sleep` | 定时器 | `clock_nanosleep`（经 Io 后端） |

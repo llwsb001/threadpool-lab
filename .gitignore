@@ -1,2 +1,6 @@
 zig-out/
 .zig-cache/
+
+# 审查运行时文件（本地保留，不入库）
+.agent-reviews/**/*.pid
+.agent-reviews/**/*.log

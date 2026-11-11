@@ -22,7 +22,8 @@ pub const Pool = struct {
     shutdown: bool = false,
 
     /// 创建池并立即启动 worker_count 个 OS 线程。
-    /// 线程诞生路径：std.Thread.spawn → pthread_create → clone。
+    /// 线程诞生路径（本项目未链接 libc）：std.Thread.spawn → LinuxThreadImpl
+    /// 直接发 clone；只有链接 libc 的构建才经 pthread_create。
     pub fn init(allocator: Allocator, io: Io, worker_count: usize) !*Pool {
         if (worker_count == 0) return error.InvalidWorkerCount;
 
@@ -70,6 +71,7 @@ pub const Pool = struct {
 
     /// 优雅关闭：标记 shutdown、广播唤醒所有 worker、join 到全部退出。
     /// 语义是排空队列——worker 会把 shutdown 前入队的任务做完。
+    /// 调用返回后 Pool 指针已失效：不得再 submit，也不得再次 deinit。
     pub fn deinit(self: *Pool) void {
         self.mutex.lockUncancelable(self.io);
         self.shutdown = true;
