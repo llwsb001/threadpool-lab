@@ -1,0 +1,674 @@
+kimi version 2.5.2
+• Let me start by reading the HANDOFF.md and the project files to understand what was done.
+
+  First, create the REVIEW.md with title and scope, then read files.Now let me check for issues. Key things to verify:
+
+  1. Zig version is 0.17.0 at /home/user/tools/zig-0.17.0/zig — verify it exists and compile.
+  2. Potential bugs in threadpool.zig:
+     - `init` partial spawn failure: errdefer allocator.destroy(self) covers self, they free workers manually. But note: `errdefer self.tasks.deinit(allocator)` is registered — fine since tasks is empty. Looks OK.
+     - One subtle issue: in the catch block of spawn, they return `err` — but errdefer allocator.destroy(self) runs, freeing self. OK.
+     - `workers` slice: if alloc of workers fails, errdefer destroy(self) runs — fine.
+     - deinit: broadcast, join all, free workers, tasks.deinit, destroy self. If tasks remain... graceful drains so empty. OK.
+     - Potential issue: `deinit` after workers started — main calls `defer pool.deinit()`. If `try pool.submit` fails midway, deinit still runs, fine.
+     - `orderedRemove(0)` — fine.
+     - Race: submit checks shutdown under lock. OK.
+     - Wait — one thing: `init` partial spawn failure path. When Thread.spawn fails for slot i, they lock mutex, set shutdown, broadcast, unlock, join workers[0..i]. Workers that started are in workerLoop, which sees shutdown and empty queue → exits. OK. But there's a subtle issue: workers[0..i] — `t` is a Thread value (not pointer) since `|t|` on a slice of Thread. join works on copy. OK.
+     - Another subtle thing: in the catch block, they free self.workers but the errdefer allocator.destroy(self) frees the Pool struct. OK.
+     - One real concern: `Io.Mutex` in Zig 0.17 — is it cancelable based on Io? The handoff says sync primitives moved to std.Io. Need to verify the API: `lockUncancelable(io)`, `waitUncancelable(io, &mutex)`, `signal(io)`, `broadcast(io)`. Need to check std library at /home/user/tools/zig-0.17.0/lib/std/Io.zig.
+     
+     Actually wait — is there a Zig 0.17? Zig's latest stable as of 2026... Zig 0.15.x was around Aug 2025. 0.17 could plausibly exist in 2026-11. Let me just verify locally with the compiler.
+
+  3. Potential bugs to check:
+     - deinit when submit fails partway: fine.
+     - Memory leak: workers freed, tasks deinit, self destroyed. init.gpa is DebugAllocator presumably. OK.
+     - What if `submit` is called after deinit started? Returns error.PoolShutdown under lock — but deinit destroys self after join, so concurrent submit during deinit's destroy is user error; documented? Not really, but it's a teaching project.
+     - A real edge: `deinit` sets shutdown and broadcasts, but a worker might be executing a task that... fine.
+     - Signal loss: submit appends then signals under lock — no signal loss possible since wait holds lock. OK.
+     - One potential issue: submit wakes only ONE worker (signal) per task — fine, each task wakes one worker.
+     - Shutdown with pending tasks: worker loop checks `if (self.shutdown and self.tasks.items.len == 0)` — drains first. Graceful. OK.
+
+  4. Possible missed issue: In `init`, if `Thread.spawn` succeeds for some workers and then fails, the catch block frees self.workers but the `errdefer self.tasks.deinit(allocator)` also runs — tasks is empty, deinit on empty ArrayList is fine (capacity 0). OK.
+
+  5. Another subtle issue: workerLoop — after taking task and unlocking, executing task. If deinit is called while workers execute tasks, join waits. OK.
+
+  6. Potential deadlock: none obvious.
+
+  7. main.zig: `Io.sleep(job.io, ...) catch {}` — swallows errors, fine for demo.
+
+  8. observe.sh: samples every 0.02s; task duration 20ms so it should catch transitions. But it runs the demo fresh each time — the handoff claims output "1 → 5 → 3". Plausible. Note: demo total runtime ~ 10 tasks × 20ms / 4 workers ≈ 60ms, so sampling at 20ms gets a few samples. The "3 (收尾退出)" claim — workers exit one at a time, so you'd see 5→4→3→2→1. Plausible to catch 3.
+
+  9. One thing to verify: does `std.process.Init` exist in 0.17 with `init.gpa` and `init.io`? That's the 0.16+ new main signature? Actually in 0.15, main is `pub fn main() !void` and `std.heap.DebugAllocator`. The new `std.process.Init` with `init.gpa`/`init.io` — I believe that was proposed for 0.16/0.17's writergate/Io overhaul. I can't rely on memory; must compile.
+
+  Let me check zig exists and build/run. Also check std.Io.Mutex API lines referenced in HANDOFF (Io.zig Mutex at 1716, Condition at 1782, sleep at 2597; Thread.zig spawn 344, getCurrentId 279).
+
+  Also check DebugAllocator: does main use `init.gpa` which is a DebugAllocator that reports leaks at exit? In 0.16+, `std.process.Init.gpa` is the debug allocator in Debug builds. Verify by building/running.
+
+  Let me run: check zig binary, build, run demo, run observe.sh.
+
+  Careful: observe.sh runs `./zig-out/bin/threadpool-lab` — the binary must be installed (zig build run installs? Actually `zig build run` runs the run step which depends on install? No — addRunArtifact runs from cache, not zig-out. `b.installArtifact(exe)` ties to default install step. `zig build run` depends only on run_cmd.step, which does NOT depend on install. So `zig-out/bin/threadpool-lab` may not exist after just `zig build run`! Hmm — actually addRunArtifact's step... In modern Zig, run artifact compiles the exe; the exe is emitted into zig-cache. installArtifact only happens on the `install` step (default). So after `zig build run`, zig-out/bin might not exist. But `zig build` (default step) installs. HANDOFF says they ran `zig build` first. But if a fresh user runs only `zig build run` then `observe.sh`, observe.sh fails because binary missing. Actually README says run `zig build run` then observe.sh — potential doc inconsistency. Let me verify: does zig-out/bin exist after clean `zig build run`? I can test but shouldn't create files? Building creates .zig-cache/zig-out — but that's allowed? "默认只读：不得修改原始工程" — building creates artifacts. Hmm. Verification requires building. The project already has .zig-cache. Running zig build modifies .zig-cache and zig-out. I think building to verify is reasonable and expected ("抽查数字和引用能否复现"). I'll build, run, then clean up zig-out if I create it (it may already exist? The listing shows no zig-out at top level — only .zig-cache exists). Actually the directory listing shows: .agent-reviews, .zig-cache, scripts, src, build.zig, README.md. No zig-out. So HANDOFF claim "rm -rf .zig-cache zig-out && zig build run" then observe.sh — if observe.sh needs zig-out/bin, it would fail unless zig build was run. Let me test whether `zig build run` creates zig-out/bin. I'll verify empirically and clean up afterward (rm -rf zig-out, and restore .zig-cache? .zig-cache existed before; I'll leave it, rebuilding just repopulates).
+
+  Also verify line numbers in Io.zig/Thread.zig references.
+
+  Also check: Zig 0.17 API — `std.Io.Mutex` has `.init`? `Io.Mutex = .init` field default. And `lockUncancelable(io)`? Let me grep the std lib.
+
+  Plan:
+  1. ls /home/user/tools/zig-0.17.0/zig, zig version
+  2. grep Io.zig for Mutex/Condition/lockUncancelable/waitUncancelable/signal/broadcast
+  3. Check line numbers cited
+  4. zig build, zig build run
+  5. observe.sh
+  6. Check zig-out question
+
+  Let me do it.0.17.0
+/home/user/tools/zig-0.17.0/lib/std/Io.zig
+/home/user/tools/zig-0.17.0/lib/std/Thread.zig
+Zig 0.17.0 confirmed. Now verify std lib references and API.
+
+• 编译器确认为 0.17.0。接着核对标准库 API 与交接文件中引用的行号。1015:        pub fn sleep(duration: Clock.Duration, io: Io) Cancelable!void {
+1289:    pub fn sleep(timeout: Timeout, io: Io) Cancelable!void {
+1716:pub const Mutex = extern struct {
+1752:    pub fn lockUncancelable(m: *Mutex, io: Io) void {
+1782:pub const Condition = struct {
+1800:    /// * `waitUncancelable`
+1816:    /// * `waitUncancelable`
+1828:        defer mutex.lockUncancelable(io);
+1872:    pub fn waitUncancelable(cond: *Condition, io: Io, mutex: *Mutex) void {
+1881:        defer mutex.lockUncancelable(io);
+1926:    pub fn signal(cond: *Condition, io: Io) void {
+1945:    pub fn broadcast(cond: *Condition, io: Io) void {
+2006:    pub fn waitUncancelable(event: *Event, io: Io) void {
+2064:    /// Assumes that there is no pending call to `wait` or `waitUncancelable`.
+2119:        q.mutex.lockUncancelable(io);
+2152:        q.mutex.lockUncancelable(io);
+2220:                pending.condition.waitUncancelable(io, &q.mutex);
+2256:        q.mutex.lockUncancelable(io);
+2333:                pending.condition.waitUncancelable(io, &q.mutex);
+2597:pub fn sleep(io: Io, duration: Duration, clock: Clock) Cancelable!void {
+279:pub fn getCurrentId() Id {
+344:pub fn spawn(config: SpawnConfig, comptime function: anytype, args: anytype) SpawnError!Thread {
+
+
+• All cited line numbers in HANDOFF are accurate: Mutex at 1716, Condition at 1782, sleep at 2597 in Io.zig; getCurrentId at 279, spawn at 344 in Thread.zig. 
+
+  Check the `.init` for Mutex and Condition — Mutex is `extern struct`, Condition is `struct`. Verify `.init` constants exist.pub const Mutex = extern struct {
+    state: std.atomic.Value(State),
+
+    pub const init: Mutex = .{ .state = .init(.unlocked) };
+
+    pub const State = enum(u32) {
+        unlocked,
+        locked_once,
+        contended,
+    };
+
+    pub fn tryLock(m: *Mutex) bool {
+        return m.state.cmpxchgStrong(.unlocked, .locked_once, .acquire, .monotonic) == null;
+    }
+
+---
+pub const Condition = struct {
+    state: std.atomic.Value(State),
+    /// Incremented whenever the condition is signaled
+    epoch: std.atomic.Value(u32),
+
+    const State = packed struct(u32) {
+        waiters: u16,
+        signals: u16,
+    };
+
+    pub const init: Condition = .{
+        .state = .init(.{ .waiters = 0, .signals = 0 }),
+        .epoch = .init(0),
+    };
+
+    /// Blocks until the condition is signaled or canceled.
+    ///
+    /// See also:
+    /// * `waitUncancelable`
+---
+    pub fn waitUncancelable(cond: *Condition, io: Io, mutex: *Mutex) void {
+        var epoch = cond.epoch.load(.acquire); // `.acquire` to ensure ordered before state load
+
+        {
+            const prev_state = cond.state.fetchAdd(.{ .waiters = 1, .signals = 0 }, .monotonic);
+            assert(prev_state.waiters < math.maxInt(u16)); // overflow caused by too many waiters
+        }
+
+        mutex.unlock(io);
+        defer mutex.lockUncancelable(io);
+
+        while (true) {
+            io.futexWaitUncancelable(u32, &cond.epoch.raw, epoch);
+
+The standard library API matches usage: `mutex: Io.Mutex = .init`, `cond: Io.Condition = .init`, `lockUncancelable(io)`, `waitUncancelable(io, &mutex)`, `signal(io)`, `broadcast(io)` all exist.
+
+  Note: Condition has 16-bit waiters counter — max 65535 waiters. Not an issue for a teaching pool with fixed workers.
+
+  Now build and run. Also verify: does `zig build run` create zig-out/bin? README says run `zig build run` then `bash scripts/observe.sh` which needs `./zig-out/bin/threadpool-lab`. Test: current dir has no zig-out (per listing). Run `zig build run` and check zig-out existence.
+
+• 标准库 API 与代码用法一致，交接文件引用的行号全部准确。现在实际构建并运行验证。      1 task  9 start (tid 2482)
+      1 task  9 done
+      1 task  8 start (tid 2479)
+      1 task  8 done
+      1 task  7 start (tid 2481)
+      1 task  7 done
+      1 task  6 start (tid 2480)
+      1 task  6 done
+      1 task  5 start (tid 2482)
+      1 task  5 done
+      1 task  4 start (tid 2479)
+      1 task  4 done
+      1 task  3 start (tid 2481)
+      1 task  3 done
+      1 task  2 start (tid 2482)
+      1 task  2 done
+      1 task  1 start (tid 2480)
+      1 task  1 done
+      1 task  0 start (tid 2479)
+      1 task  0 done
+
+
+• Compiled and ran cleanly. 10 tasks all start/done, exactly 4 distinct tids (2479, 2480, 2481, 2482), and tids are reused (e.g. 2482 did tasks 2, 5, 9). Matches HANDOFF claims.
+
+  Now check whether zig-out/bin was created by `zig build run` (relevant to observe.sh + README ordering).ls: cannot access 'zig-out/bin': No such file or directory
+---
+      1 threads alive: 0
+Found a real problem: `zig build run` does NOT install the binary into zig-out/bin. So following README's instructions (`zig build run` then `bash scripts/observe.sh`), observe.sh fails: `./zig-out/bin/threadpool-lab` doesn't exist. The script has `set -e` but the background launch failure... Let me see: `./zig-out/bin/threadpool-lab >/dev/null 2>&1 &` — the launch fails immediately, pid set to a dead process; `kill -0` fails, loop skipped; `wait "$pid"` returns 127? But output showed "threads alive: 0" once — interesting: ls /proc/$pid/task failed (process gone), so `ls ... | wc -l` gives 0? With set -e and pipe... `ls` fails with 2>/dev/null suppressed, wc -l prints 0, so prints "threads alive: 0", then kill -0 fails next iteration and loop exits. Wait, actually first iteration: kill -0 "$pid" — the process already exited, but maybe zombie since not yet waited? Actually bash reaps background children when they exit... a started-then-immediately-failed child may remain a zombie until wait, so kill -0 succeeds once. Then ls fails → 0 → prints "threads alive: 0". Then wait "$pid" returns 127 (No such file). Exit code of script: 127. So the script fails confusingly with `set -e`? wait returns 127, script exits 127. So README's documented flow is broken.
+
+  This is a genuine P1 (or P2?) issue: README's quickstart produces a failing observation step. HANDOFF claims observe.sh sampled 1→5→3, which means the executor must have run `zig build` (install) at some point — HANDOFF §5 says "干净重建 rm -rf .zig-cache zig-out && zig build run" passed, but after that, zig-out wouldn't exist either... wait, they said "rm -rf .zig-cache zig-out && zig build run" — after that, zig-out is absent. Then observe.sh would fail. Unless `zig build` was run separately. Hmm — HANDOFF claims observe.sh worked with sampling 1→5→3. That requires zig-out/bin/threadpool-lab. Perhaps they ran `zig build` (default install step) first, then observe.sh. The "验证情况" table lists compile (zig build) before observe.sh, so in their session zig-out existed. But README documents only `zig build run`, and observe.sh README section says just run it. So a fresh user following README hits the failure. This is a doc/robustness inconsistency: P1 or P2. It breaks one acceptance criterion's reproducibility ("提供受限沙箱内可用的行为观察手段" — the means works but only after `zig build`, which README doesn't tell you; actually README says run `zig build run`). I'd rate P2 since easily fixed (observe.sh could build, or README say `zig build`), but it does break the documented happy path. Given it's a teaching project and the very first thing a learner does, maybe P1. Let me weigh: the criterion "提供观察手段" is met technically (binary exists after zig build), but the documented path fails. I'll call it P1 for doc/repro break, or P2. It's a real defect in the deliverable as documented — I'll say P1? Hmm. The user following README literally: `zig build run` works (demo runs), then `bash scripts/observe.sh` prints "threads alive: 0" and exits 127 — confusing. That breaks acceptance criterion 5's spirit. P1.
+
+  Fix options: observe.sh should run `zig build` first, or README should say `zig build` then observe. Simplest: in observe.sh add `zig build` before launching (uses installed binary). 
+
+  Now run `zig build` and re-run observe.sh to verify the observation claim.      2 threads alive: 1
+      1 threads alive: 3
+      1 threads alive: 5
+After `zig build`, observe.sh works and samples 1 → 5 → 3 (and back), matching HANDOFF's claim of "1 → 5 → 3". Good — the claim is reproducible when the binary exists.
+
+  Now check memory-leak verification claim: DebugAllocator exit check. In 0.17, `std.process.Init.gpa` — is it a DebugAllocator in Debug mode that reports leaks? Let me check what init.gpa is. Default build is Debug. Run produced no leak output. Let me confirm gpa is DebugAllocator in std.process.Init.
+
+  Also test edge: does build have warnings? zig build was clean.
+
+  Let me also check a subtle logic point: In init's error path, `errdefer self.tasks.deinit(allocator)` — tasks is `.empty` and never appended before spawn loop, fine. Also in the catch block they free workers and return err; errdefer destroys self. Good.
+
+  One more check: `init.gpa` type. Let me grep std/process.zig or the Init struct.1:40:    gpa: Allocator,
+3:507:pub fn run(gpa: Allocator, io: Io, options: RunOptions) RunError!RunResult {
+---
+31:pub const Init = struct {
+32-    /// `Init` is a superset of `Minimal`; the latter is included here.
+33-    minimal: Minimal,
+34-    /// Permanent storage for the entire process, cleaned automatically on
+35-    /// exit. Threadsafe.
+36-    arena: *std.heap.ArenaAllocator,
+37-    /// A default-selected general purpose allocator for temporary heap
+38-    /// allocations. Debug mode will set up leak checking if possible.
+39-    /// Threadsafe.
+40-    gpa: Allocator,
+41-    /// An appropriate default Io implementation based on the target
+42-    /// configuration. Debug mode will set up leak checking if possible.
+43-    io: Io,
+44-    /// Environment variables, initialized with `gpa`. Not threadsafe.
+45-    environ_map: *Environ.Map,
+46-    /// Named files that have been provided by the parent process. This is
+47-    /// mainly useful on WASI, but can be used on other systems to mimic the
+48-    /// behavior with respect to stdio.
+49-    preopens: Preopens,
+50-
+51-    /// Alternative to `Init` as the first parameter of the main function.
+52-    pub const Minimal = struct {
+53-        /// Environment variables.
+54-        environ: Environ,
+55-        /// Command line arguments.
+56-        args: Args,
+57-    };
+58-};
+59-
+60-pub const CurrentPathError = error{
+61-    /// Buffer is too small to contain the current path.
+Confirmed: `init.gpa` in Debug mode sets up leak checking. The demo run produced no leak report, so the leak check passes — consistent with HANDOFF.
+
+  Now let me do a deeper code review for correctness issues:
+
+  1. **workerLoop condition logic**: 
+  ```
+  while (tasks.len == 0 and !shutdown) wait
+  if (shutdown and tasks.len == 0) exit
+  task = orderedRemove(0)
+  ```
+  Correct. On shutdown with pending tasks, workers drain. On shutdown with empty queue, all exit. signal-per-task is fine.
+
+  2. **Potential issue — submit after shutdown**: returns error.PoolShutdown. OK.
+
+  3. **deinit called twice / submit after deinit**: use-after-free; not guarded — typical for teaching code, but not documented beyond general ctx lifecycle note. Minor.
+
+  4. **init partial-spawn cleanup path**: 
+  ```zig
+  slot.* = Thread.spawn(...) catch |err| {
+      self.mutex.lockUncancelable(self.io);
+      self.shutdown = true;
+      self.cond.broadcast(self.io);
+      self.mutex.unlock(self.io);
+      for (self.workers[0..i]) |t| t.join();
+      self.allocator.free(self.workers);
+      return err;
+  };
+  ```
+  - errdefer allocator.destroy(self) runs. workers freed manually. tasks deinit via errdefer. Correct.
+  - Edge: worker i fails but workers 0..i-1 are running; they see shutdown & empty queue and exit. join OK.
+  - Subtle: if spawn fails on the FIRST worker (i=0), loop `self.workers[0..0]` — empty, fine.
+  - One subtlety: `Thread.spawn` in Zig 0.17 — on Linux it uses clone directly, not pthread_create? HANDOFF/README say "pthread_create → clone". Let me check Thread.zig spawn implementation. Zig std has used its own clone on Linux for a long time (not pthread). Let me check.
+
+  5. **Condition waiters u16 overflow**: assert fails if > 65535 waiters — irrelevant here.
+
+  6. **`errdefer self.tasks.deinit(allocator)` position**: registered after `self.* = .{...}` — yes it's after, line 38, and workers alloc inside struct literal... wait: `.workers = try allocator.alloc(...)` is INSIDE the struct literal assignment to self.*. If alloc fails, errdefer destroy(self) runs (registered at line 30). Fine.
+
+  7. **orderedRemove(0)** is O(n) — fine for teaching.
+
+  8. **A subtle signal-loss scenario**: submit appends and signals while holding the lock; any waiter either sees non-empty queue or is waiting atomically. No loss. Broadcast on shutdown while holding lock — fine.
+
+  9. **Race between two submits and one worker?** Each submit signals once; each signal wakes at most one waiter, but signals accumulate? Condition's signal increments epoch; if no waiters, signal is lost — but that's fine because a non-waiting worker will check the queue under lock before waiting. Standard correct pattern. ✓
+
+  10. **Graceful deinit when a task panics**: HANDOFF lists this as known limitation. OK.
+
+  11. **observe.sh issues**: 
+     - Requires pre-built binary (the P1 found).
+     - `ls /proc/$pid/task | wc -l | tr -d ' '` — wc -l output already a number; fine.
+     - `set -e` + failing ls inside command substitution: doesn't abort due to subshell; prints 0. The confusing failure mode.
+     - Sampling 20ms vs task duration 20ms: could miss transient states, but observed fine.
+
+  12. **README claims check**:
+     - "std.Thread.spawn → pthread_create → clone" — Zig's std.Thread.spawn on Linux uses raw clone syscall, NOT pthread_create. Let me verify in Thread.zig / os/linux. This matters for teaching accuracy (the README's syscall mapping table). Let me grep.
+     - "Mutex 快路径 CAS；争用后 futex" — true per Io.zig.
+     - "cond.wait/signal → futex(FUTEX_WAIT/WAKE)" — Io Condition uses io.futexWait; on the default blocking Io backend, that's a futex syscall. Plausible; check the default io backend in main — init.io is what? For a simple exe, it's... `std.Io.Threaded`? In 0.17, default Io for Init is a threaded/blocking backend where futexWait maps to std.Thread.Futex → futex syscall. Good enough; but let me check which backend init.io is, to assess the claim "futex 调用仅在标准库源码层确认（Io.zig 中 Mutex/Condition 经 io.futexWait/futexWake）". 
+     - "Io.sleep → clock_nanosleep" — for the blocking backend, sleep maps to nanosleep? Check std.Io.Threaded sleep implementation. It might use a timer heap with clock_nanosleep. Also README v2 section references `std.Io.Timeout` and `cond.waitTimeout(io, &mutex, timeout)` — check waitTimeout exists in Condition. Grep showed no waitTimeout in the earlier grep (I grepped only some patterns). Let me check: README says "worker 等待改用 cond.waitTimeout(io, &mutex, timeout)：返回 error.Timeout…（读 Io.zig 中 waitTimeout 源码可见这条规则）". Does Condition have waitTimeout in 0.17? Need to verify — if not, that's a doc error in the v2 exercise guidance.
+     - `std.Io.Evented` mentioned in extension 3 — check it exists in 0.17.
+
+  Let me grep for these.16:pub const use_pthreads = native_os != .windows and native_os != .wasi and builtin.link_libc;
+20:else if (use_pthreads)
+63:        .linux => if (use_pthreads) {
+64:            if (self.getHandle() == std.c.pthread_self()) {
+69:                const err = std.c.pthread_setname_np(self.getHandle(), name_with_terminator.ptr);
+99:        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => if (use_pthreads) {
+101:            if (self.getHandle() != std.c.pthread_self()) return error.Unsupported;
+103:            const err = std.c.pthread_setname_np(name_with_terminator.ptr);
+109:        .serenity => if (use_pthreads) {
+110:            const err = std.c.pthread_setname_np(self.getHandle(), name_with_terminator.ptr);
+---
+1801:    /// * `waitTimeout`
+1803:        waitTimeout(cond, io, mutex, .none) catch |err| switch (err) {
+1817:    pub fn waitTimeout(cond: *Condition, io: Io, mutex: *Mutex, timeout: Timeout) WaitTimeoutError!void {
+2027:    pub fn waitTimeout(event: *Event, io: Io, timeout: Timeout) WaitTimeoutError!void {
+---
+31:pub const Evented = if (fiber.supported) switch (builtin.os.tag) {
+2695:    _ = Evented;
+Findings:
+
+  1. `use_pthreads = ... and builtin.link_libc` — so pthread_create is only used when linking libc. This project does NOT link libc (build.zig has no linkLibC). So on Linux, spawn uses raw clone, not pthread_create. README's claim "std.Thread.spawn → pthread_create → clone" and threadpool.zig comment line 25 "线程诞生路径：std.Thread.spawn → pthread_create → clone" are inaccurate for this build: without libc, it's a direct clone/clone3 syscall. Let me confirm the spawn implementation path: `else if (use_pthreads)` at line 20 — need to see the SpawnImpl selection. Check around lines 16-30 of Thread.zig.
+
+  2. waitTimeout exists at Io.zig:1817 with signature `(cond, io, mutex, timeout)` — matches README's `cond.waitTimeout(io, &mutex, timeout)` (method syntax). ✓. Check its doc about signal-priority-over-timeout claim. Let me read lines 1801-1830.
+
+  3. Evented exists (Io.zig:31). ✓
+
+  Let me check Thread.zig spawn impl selection and the waitTimeout docs.const testing = std.testing;
+
+pub const use_pthreads = native_os != .windows and native_os != .wasi and builtin.link_libc;
+
+const Impl = if (native_os == .windows)
+    WindowsThreadImpl
+else if (use_pthreads)
+    PosixThreadImpl
+else if (native_os == .linux)
+    LinuxThreadImpl
+else if (native_os == .wasi)
+    WasiThreadImpl
+else
+    UnsupportedImpl;
+
+impl: Impl,
+
+---
+344:pub fn spawn(config: SpawnConfig, comptime function: anytype, args: anytype) SpawnError!Thread {
+475:    fn spawn(config: SpawnConfig, comptime f: anytype, args: anytype) !Impl {
+523:    fn spawn(config: SpawnConfig, comptime f: anytype, args: anytype) !Impl {
+745:    fn spawn(config: SpawnConfig, comptime f: anytype, args: anytype) !Impl {
+908:    fn spawn(config: std.Thread.SpawnConfig, comptime f: anytype, args: anytype) SpawnError!WasiThreadImpl {
+1437:    fn spawn(config: SpawnConfig, comptime f: anytype, args: anytype) !Impl {
+---
+pub fn spawn(config: SpawnConfig, comptime function: anytype, args: anytype) SpawnError!Thread {
+    if (builtin.single_threaded) {
+        @compileError("Cannot spawn thread when building in single-threaded mode");
+    }
+
+    const impl = try Impl.spawn(config, function, args);
+    return Thread{ .impl = impl };
+}
+
+/// Represents a kernel thread handle.
+/// May be an integer or a pointer depending on the platform.
+pub const Handle = Impl.ThreadHandle;
+
+/// Returns the handle of this thread
+pub fn getHandle(self: Thread) Handle {
+    return self.impl.getHandle();
+}
+
+/// Release the obligation of the caller to call `join()` and have the thread clean up its own resources on completion.
+/// Once called, this consumes the Thread object and invoking any other functions on it is considered undefined behavior.
+pub fn detach(self: Thread) void {
+    return self.impl.detach();
+}
+
+/// Waits for the thread to complete, then deallocates any resources created on `spawn()`.
+/// Once called, this consumes the Thread object and invoking any other functions on it is considered undefined behavior.
+pub fn join(self: Thread) void {
+    return self.impl.join();
+}
+
+pub const YieldError = error{
+    /// The system is not configured to allow yielding
+    SystemCannotYield,
+};
+
+/// Yields the current thread potentially allowing other threads to run.
+pub fn yield() YieldError!void {
+    if (native_os == .windows) switch (windows.ntdll.NtYieldExecution()) {
+        .SUCCESS, .NO_YIELD_PERFORMED => return,
+        else => return error.SystemCannotYield,
+    };
+    switch (posix.errno(posix.system.sched_yield())) {
+        .SUCCESS => return,
+        .NOSYS => return error.SystemCannotYield,
+        else => return error.SystemCannotYield,
+    }
+}
+
+/// State to synchronize detachment of spawner thread to spawned thread
+const Completion = std.atomic.Value(enum(if (builtin.zig_backend == .stage2_riscv64) u32 else u8) {
+    running,
+    detached,
+    completed,
+});
+
+/// Performs implementation-agnostic thread setup (`maybeAttachSignalStack`), then calls the given
+/// thread entry point `f` with `args` and handles the result.
+fn callFn(comptime f: anytype, args: anytype) switch (Impl) {
+    WindowsThreadImpl => windows.NTSTATUS,
+    LinuxThreadImpl => u8,
+    PosixThreadImpl => ?*anyopaque,
+    else => unreachable,
+} {
+    maybeAttachSignalStack();
+
+    const default_value = switch (Impl) {
+        WindowsThreadImpl => .SUCCESS,
+        LinuxThreadImpl => 0,
+        PosixThreadImpl => null,
+        else => unreachable,
+    };
+    const bad_fn_ret = "expected return type of startFn to be 'u8', 'noreturn', '!noreturn', 'void', or '!void'";
+
+    switch (@typeInfo(@typeInfo(@TypeOf(f)).@"fn".return_type.?)) {
+        .noreturn => {
+            @call(.auto, f, args);
+        },
+    };
+
+    /// Blocks until the condition is signaled or canceled.
+    ///
+    /// See also:
+    /// * `waitUncancelable`
+    /// * `waitTimeout`
+    pub fn wait(cond: *Condition, io: Io, mutex: *Mutex) Cancelable!void {
+        waitTimeout(cond, io, mutex, .none) catch |err| switch (err) {
+            error.Timeout => unreachable,
+            error.Canceled => |e| return e,
+        };
+    }
+
+    pub const WaitTimeoutError = Cancelable || Timeout.Error;
+
+    /// Blocks until the condition is signaled, canceled, or the provided
+    /// timeout expires.
+    ///
+    /// See also:
+    /// * `wait`
+    /// * `waitUncancelable`
+    pub fn waitTimeout(cond: *Condition, io: Io, mutex: *Mutex, timeout: Timeout) WaitTimeoutError!void {
+        const deadline = timeout.toDeadline(io);
+
+        var epoch = cond.epoch.load(.acquire); // `.acquire` to ensure ordered before state load
+
+        {
+            const prev_state = cond.state.fetchAdd(.{ .waiters = 1, .signals = 0 }, .monotonic);
+            assert(prev_state.waiters < math.maxInt(u16)); // overflow caused by too many waiters
+        }
+
+        mutex.unlock(io);
+        defer mutex.lockUncancelable(io);
+
+        while (true) {
+            const result = io.futexWaitTimeout(u32, &cond.epoch.raw, epoch, deadline);
+
+            epoch = cond.epoch.load(.acquire); // `.acquire` to ensure ordered before `state` laod
+
+            // We were woken normally, so try to consume a pending signal. A signal takes
+            // priority over an expired deadline, so this is checked before the deadline
+            // below. On error we safely remove ourselves as a waiter and propagate the error.
+            if (result) |_| {
+                var prev_state = cond.state.load(.monotonic);
+                while (prev_state.signals > 0) {
+                    prev_state = cond.state.cmpxchgWeak(prev_state, .{
+                        .waiters = prev_state.waiters - 1,
+                        .signals = prev_state.signals - 1,
+                    }, .acquire, .monotonic) orelse {
+                        // We successfully consumed a signal.
+                        return;
+                    };
+                }
+            } else |err| {
+                cond.deregister(io);
+                return err;
+            }
+
+            // There are no signals available and no error; if a timeout was specified and
+            // the deadline has passed, remove ourselves as a waiter and return
+            // `error.Timeout`. Otherwise, this was a spurious wakeup: loop back to the
+            // futex wait.
+            switch (deadline) {
+                .none => {},
+                .deadline => |d| if (d.untilNow(io).raw.nanoseconds >= 0) {
+                    cond.deregister(io);
+                    return error.Timeout;
+                },
+                .duration => unreachable,
+            }
+        }
+    }
+
+    /// Same as `wait`, except does not introduce a cancelation point.
+    ///
+    /// See `Future.cancel` for a description of cancelation points.
+Confirmed:
+
+  1. **waitTimeout signal-priority claim**: Io.zig:1837-1839 comment "A signal takes priority over an expired deadline, so this is checked before the deadline below." — README's v2 hint is accurate. ✓
+
+  2. **pthread_create claim**: `use_pthreads = native_os != .windows and native_os != .wasi and builtin.link_libc`. This project doesn't link libc (build.zig has no linkLibC, and Zig defaults to not linking libc). So `Impl = LinuxThreadImpl` on Linux — spawn goes through raw `clone` syscall, NOT pthread_create. Let me confirm LinuxThreadImpl.spawn uses clone directly (line 523 area). Quick check.
+
+  So README syscall table row "std.Thread.spawn → pthread_create → clone" is wrong for this build (no libc). It's pthread_create only when linking libc. Also threadpool.zig comment line 25 repeats it. Impact: teaching accuracy — the core point of the project is syscall mapping. P2 (inaccurate teaching content) — the syscall is still clone, so the bottom line is right, but the intermediate claim is wrong and could mislead. Also HANDOFF didn't claim it, it's in README+code comment.
+
+  3. Check Io.sleep → clock_nanosleep claim. init.io default backend: what is it for this exe? Let me check how Init sets io — probably `std.Io.Threaded`. And Threaded's sleep implementation. Check quickly.
+
+  4. Also check Condition `waitUncancelable` uses futexWaitUncancelable — HANDOFF says "futex 调用仅在标准库源码层确认（Io.zig 中 Mutex/Condition 经 io.futexWait/futexWake）" — the actual function is futexWaitUncancelable; close enough. And whether the default io backend implements futexWait via actual futex syscall (std.Thread.Futex). Check the Threaded io backend.
+
+  Let me check: what is init.io's concrete type for a linux native exe?---
+/home/user/tools/zig-0.17.0/lib/std/start.zig:834:        .io = threaded.io(),
+---
+/home/user/tools/zig-0.17.0/lib/std/Io.zig
+1542:        switch (linux.errno(linux.clone(
+---
+    var environ_map = std.process.Environ.createMap(.{ .block = environ }, gpa) catch |err|
+        std.process.fatal("failed to parse environment variables: {t}", .{err});
+    defer environ_map.deinit();
+
+    const preopens = std.process.Preopens.init(arena_allocator.allocator()) catch |err|
+        std.process.fatal("failed to init preopens: {t}", .{err});
+
+    return wrapMain(root.main(.{
+        .minimal = .{
+            .args = .{ .vector = args },
+            .environ = .{ .block = environ },
+        },
+        .arena = &arena_allocator,
+        .gpa = gpa,
+        .io = threaded.io(),
+        .environ_map = &environ_map,
+        .preopens = preopens,
+    }));
+}
+
+inline fn wrapMain(result: anytype) u8 {
+    const ReturnType = @TypeOf(result);
+    switch (ReturnType) {
+        void => return 0,
+        noreturn => unreachable,
+        u8 => return result,
+        else => {},
+    }
+    if (@typeInfo(ReturnType) != .error_union) @compileError(bad_main_ret);
+
+    const unwrapped_result = result catch |err| {
+---
+571:                Thread.futexWake(&to_signal.raw, 1);
+621:            Thread.futexWaitUncancelable(&num_completed.raw, 0, if (need_signal) timeout_ns else null);
+765:                Thread.futexWake(&to_signal.raw, 1);
+785:            Thread.futexWaitUncancelable(&num_completed.raw, 0, if (need_signal) timeout_ns else null);
+936:    fn futexWaitUncancelable(ptr: *const u32, expect: u32, timeout_ns: ?u64) void {
+937:        return Thread.futexWaitInner(ptr, expect, true, timeout_ns) catch unreachable;
+940:    fn futexWait(ptr: *const u32, expect: u32, timeout_ns: ?u64) Io.Cancelable!void {
+941:        return Thread.futexWaitInner(ptr, expect, false, timeout_ns);
+944:    fn futexWaitInner(ptr: *const u32, expect: u32, uncancelable: bool, timeout_ns: ?u64) Io.Cancelable!void {
+1105:            else => @compileError("unimplemented: futexWait"),
+Confirmed:
+  - `LinuxThreadImpl.spawn` at Thread.zig:1542 uses `linux.clone(` directly — no pthread_create when not linking libc (this project doesn't link libc). So the README/code-comment claim "pthread_create → clone" is inaccurate for this build. The correct chain here: `std.Thread.spawn` → LinuxThreadImpl.spawn → `clone` syscall.
+  - `init.io` = `threaded.io()` = `std.Io.Threaded` — a thread-pool-based blocking backend. Its futex ops map to `Thread.Futex` → real futex syscalls on Linux. So the README claims about Mutex/Condition → futex hold.
+  - `Io.sleep` via Threaded backend → presumably timer → clock_nanosleep. Check briefly: grep clock_nanosleep in Threaded.zig.
+
+  Also check DebugAllocator leak report: in start.zig, gpa — check what it is in Debug mode. Line ~800 of start.zig. Let me look quickly at the gpa setup and whether it reports leaks at exit.
+
+  Then examine remaining issues:
+
+  - observe.sh: also note it leaves the binary requirement undocumented; also its `set -e` weirdness when binary missing (exit code 127, misleading "threads alive: 0"). One more check on observe.sh: `ls | wc -l | tr -d ' '` — wc -l with no filename prints just number; fine.
+
+  - main.zig: jobs on stack, deinit joins → safe. ✓ The demo uses 20ms sleep; observe samples every 20ms — fine.
+
+  - threadpool.zig potential issues not in HANDOFF:
+    a. `submit` with `error.PoolShutdown` after deinit begins — but deinit destroys self after join; user must not call submit concurrently with deinit. Documented? Not explicitly. Teaching-grade acceptable; note as P3.
+    b. Memory ordering: all shared state under mutex. ✓
+    c. If a worker thread's task panics → process aborts (known, in HANDOFF). ✓
+    d. `init` failure path: potential double-free? workers freed in catch; errdefer destroy(self). tasks.deinit errdefer — registered unconditionally at line 38; on success path errdefers don't run. ✓
+    e. One subtle thing: in `init` error path, broadcast happens while holding lock — fine. Workers join. ✓
+    f. Condition waiters limit 65535 — irrelevant.
+    g. `orderedRemove(0)` O(n) — fine for teaching; could mention as P3 perf note? Not needed.
+    h. What if `submit` is called before `init` finishes spawning? Not possible; init returns after spawning.
+    i. Zero-worker error.InvalidWorkerCount — good.
+    j. deinit without any submit — works: broadcast, workers see shutdown+empty, exit. ✓
+
+  - Cross-consistency: README says "demo：4 worker 处理 10 任务" matches main.zig. HANDOFF file list matches actual files. ✓
+
+  - build.zig: no test step. Project has no tests; teaching demo — acceptable, note as observation. Also no `linkLibC` — fine.
+
+  - One more check on acceptance criterion "无内存泄漏/重复释放（DebugAllocator 退出检查）": verified no leak output on run. But does init.gpa actually check? "Debug mode will set up leak checking if possible" (process.zig doc). Build default is Debug. ✓ Also could run in Debug explicitly — default. Fine.
+
+  - The partial-spawn failure path: hard to test without forcing failure. Code review only — logic looks correct. Mark as reviewed-statically.
+
+  - One more potential issue in observe.sh: if run from a fresh clone where the user did `zig build run` only — the P1. Also note `zig build run` in 0.17 doesn't install; confirmed empirically.
+
+  Let me quickly check clock_nanosleep in Threaded.zig to validate the sleep claim, and check gpa leak-check setup in start.zig.11911:    if (@TypeOf(posix.system.clock_nanosleep) != void) return sleepPosix(timeout);
+11929:        const rc = posix.system.clock_nanosleep(clock_id, .{ .ABSTIME = switch (timeout) {
+11933:        // POSIX-standard libc clock_nanosleep() returns *positive* errno values directly
+11994:        switch (posix.errno(posix.system.nanosleep(&timespec, &timespec))) {
+18200:    // These targets have `_lwp_park`, which is superior to POSIX nanosleep because it has a better
+---
+794:    const gpa = if (use_safe_allocator)
+809:    const arena_backing_allocator = if (is_wasm) gpa else std.heap.page_allocator;
+814:    var threaded: std.Io.Threaded = .init(gpa, .{
+820:    var environ_map = std.process.Environ.createMap(.{ .block = environ }, gpa) catch |err|
+833:        .gpa = gpa,
+        .args = .{ .vector = args },
+        .environ = .{ .block = environ },
+    }));
+
+    const gpa = if (use_safe_allocator)
+        safe_allocator.allocator()
+    else if (builtin.link_libc)
+        std.heap.c_allocator
+    else if (is_wasm)
+        std.heap.wasm_allocator
+    else if (!builtin.single_threaded)
+`use_safe_allocator` in Debug → DebugAllocator with leak checking. The demo run printed no leak diagnostics → leak-free claim verified.
+
+  All facts verified. Now compile the review:
+
+  Acceptance criteria check:
+  1. ✅ Zig 0.17.0 编译运行 — verified: `zig build` clean, `zig build run` works.
+  2. ✅ 固定 worker 线程池：submit 入队、worker 复用（实测 4 tid 复用 10 任务）、优雅关闭 join（deinit broadcast + join + 排空语义）。Code review confirms correctness: while-loop guard, wait atomicity via std.Io.Condition, signal under lock, drain semantics.
+  3. ✅ 教学文档：README covers syscall table, 4 mechanisms (spurious wakeup, wait atomicity, lock-free execution, ctx lifetime). One inaccuracy: pthread_create claim.
+  4. ✅ 无泄漏：Debug build + init.gpa (safe allocator with leak checking), run produced no leak report.
+  5. ⚠️ 观察手段：observe.sh works only if `zig build` (install) was run; README tells user to run `zig build run` which does NOT create zig-out/bin → documented flow fails. P1 (breaks documented quickstart) — or P2? Let me decide. The criterion is "提供受限沙箱内可用的行为观察手段" — the means exists and works (I verified after zig build), but the documented entry path is broken, producing confusing "threads alive: 0" and exit 127. For a teaching project where the README is the primary interface, I'd call this P1? Hmm. Severity definitions: P0 = blocking/critical incorrectness; P1 = significant defect affecting stated requirements; P2 = moderate; P3 = minor. The acceptance criterion is arguably still met since the tool works with `zig build`. But README's "运行" section is wrong. I'll grade P1 — it breaks the documented reproduction path of an acceptance criterion, though with a trivial workaround. Actually, let me reconsider: the criterion "提供受限沙箱内可用的行为观察手段" is satisfied — the script exists and works in the sandbox. The defect is README/script robustness. I'll say P2 with clear reproduction, but flag that it undermines criterion 5's reproducibility... Hmm. The instructions say to give clear judgment. I think P1 is defensible because following the project's own README verbatim fails. But the impact is trivially recoverable. I'll go P2 — no wait. Let me think about what matters: a learner runs README commands in order: `zig build run` ✓, `bash scripts/observe.sh` ✗ (threads alive: 0, exit 127, confusing). That's a broken first-run experience of a stated deliverable. I'll classify P1 (documented workflow broken) and note the trivial fix.
+
+  6. pthread_create claim — P2 teaching inaccuracy. Evidence: Thread.zig:16 `use_pthreads = ... and builtin.link_libc`; build.zig never links libc; LinuxThreadImpl.spawn uses linux.clone directly (Thread.zig:1542). So actual chain: spawn → clone (direct). README row and threadpool.zig:25 comment both say pthread_create → clone.
+
+  7. Other minor points:
+     - HANDOFF itself is accurate (verification table claims reproduced: 4 tids reused, 1→5→3 sampling, clean build). ✓
+     - observe.sh `set -e` failure mode: when binary missing it prints one bogus "threads alive: 0" and exits 127 — part of P1.
+     - No unit tests; only demo run — HANDOFF discloses this ("未做并发压力测试"). Consistent, note in risks.
+     - deinit-while-submit race / use-after-free if API misused — documented partially; P3 note.
+     - README v2 hints verified accurate (waitTimeout exists, signal-over-timeout priority confirmed in Io.zig:1837-1839 comment; std.Io.Evented exists).
+     - HANDOFF's claimed std line numbers all verified exact (Mutex 1716, Condition 1782, sleep 2597; spawn 344, getCurrentId 279).
+     - Mutex/Condition futex claims: default io = Io.Threaded (start.zig:834), futexWait → Thread.Futex → real futex syscall. ✓ Io.sleep → clock_nanosleep confirmed (Threaded.zig:11929). ✓
+     - Also HANDOFF says "futex 调用仅在标准库源码层确认（Io.zig 中 Mutex/Condition 经 io.futexWait/futexWake）" — accurate-ish: code path is waitUncancelable → io.futexWaitUncancelable. Minor wording, fine.
+
+  One more check: does `zig build` produce warnings? It was clean (no output). ✓
+
+  Also: I should test the partial-spawn failure path? Can't easily force spawn failure. Static review only — mark as such.
+
+  Also should I double-check `error.InvalidWorkerCount` and submit-after-shutdown behavior? Static review sufficient.
+
+  Also check .zig-cache cleanliness — I created zig-out via `zig build`. I should clean up zig-out since it wasn't there before? The instruction: "默认只读：不得修改原始工程" — but verification required building. The original listing had .zig-cache but no zig-out. To leave things as found, remove zig-out. .zig-cache contents changed but it pre-existed; a rebuild would repopulate anyway. I'll rm -rf zig-out to restore original state. Also /tmp/tpl-run1.txt — temp file outside project, remove it.
+
+  Also check git status? No .git in listing — not a git repo. Fine.
+
+  Now write the report sections: update REVIEW.md fully. Let me append sections via Edit.
+
+  Overall conclusion: PASS WITH RISKS — all acceptance criteria substantively met and verified; issues found are P1 doc-flow break + P2 teaching inaccuracy. Hmm — with a P1, is it NEEDS CHANGES? The P1 is a broken documented workflow (observe.sh after zig build run). That arguably warrants NEEDS CHANGES. But severity: workaround is one command. The core deliverable (thread pool correctness, teaching content) is solid. Let me weigh: the definitions aren't given beyond names. I'd say: P1 = should fix; overall verdict NEEDS CHANGES if P0 or P1 exists? Not necessarily — a small doc/script fix... The broken README quickstart is a real functional gap in criterion 5's delivery. I'll go with PASS WITH RISKS vs NEEDS CHANGES... 
+
+  Decision: The observe.sh issue means a stated acceptance criterion ("提供受限沙箱内可用的行为观察手段") fails when exercised exactly as documented. That's more than a "risk" — it's a defect requiring a one-line fix (build before sampling or document `zig build`). Combined with the pthread_create teaching inaccuracy (wrong in the project's central teaching table), I'll conclude NEEDS CHANGES. Both fixes are small but genuine defects. Hmm, but is that too harsh? "不要机械罗列正反观点，也不要为了找问题而挑刺" — these are real, evidence-backed findings that affect the deliverable's stated goals (teaching accuracy + reproducible observation). NEEDS CHANGES is justified. Actually let me reconsider severity: is observe.sh issue P1? Reproduction path in README's own "运行" section fails. Yes P1. And pthread_create P2.
+
+  Final verdict: NEEDS CHANGES.
+
+  Now clean up zig-out and tmp file, then write the full report.
+
+• 所有关键事实已核对完毕。清理我验证过程中产生的构建产物，然后落盘完整报告。build.zig
+README.md
+scripts
+src
+
+
+• Report complete. Summarize for the user.
+
+• 审查完成，报告已落盘至 `.agent-reviews/20261111-1607-threadpool-v1/REVIEW.md`。
+
+  **总体结论：NEEDS CHANGES**
+
+  核心结论：
+
+  - **线程池实现本身是正确的**。实测复现了交接文件的全部声明：Zig 0.17.0 编译零警告、10 个任务由恰好 4 个 tid 复用完成、优雅关闭排空队列、DebugAllocator 无泄漏报告。交接文件引用的标准库行号全部精确命中，README 的 v2 提示（`waitTimeout` 信号优先于超时、`std.Io.Evented`）也经源码核实属实。HANDOFF 没有夸大或隐瞒。
+
+  发现的问题（按严重度）：
+
+  - **P1 — README 的运行路径走不通**：README 让读者先跑 `zig build run` 再跑 `observe.sh`，但 `zig build run` 不产出 `zig-out/bin/`（build.zig 的 run step 不依赖 install），实测按文档顺序执行观察脚本会输出误导性的 `threads alive: 0` 并以 127 退出。先 `zig build` 则一切正常（采样到 1→5→3）。
+  - **P2 — syscall 对照表首行失准**：README 和代码注释称 `std.Thread.spawn → pthread_create → clone`，但本项目未链接 libc，Zig 0.17 走 `LinuxThreadImpl` 直接发 `clone`（Thread.zig:16、1542），不经过 pthread。教学项目核心表格内容需要订正。
+  - **P3** — `deinit` 后 `submit` 属 use-after-free 但未声明约束。
+
+  验证过程中产生的 `zig-out/` 已删除，项目恢复原状。两个待修问题都是一两行的修复，建议在下一轮处理。
+
+To resume this session: kimi -r session_fa95c03f-21c0-4d23-aac4-4bbb5b38572b
