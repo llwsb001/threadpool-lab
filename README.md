@@ -18,7 +18,9 @@ threadpool-lab/
 ├── scripts/observe.sh         # /proc 线程数采样
 └── src/
     ├── threadpool.zig         # 池实现：v1 固定 worker 数
-    └── main.zig               # demo：4 worker 处理 10 任务
+    ├── main.zig               # demo：4 worker 处理 10 任务
+    ├── dynamic_pool.zig       # 池实现：v2 懒创建 + 空闲超时退出
+    └── stress.zig             # v2 压测与行为演示（zig build stress）
 ```
 
 ## 架构
@@ -70,6 +72,9 @@ strace -f -e trace=futex,clone,clone3,clock_nanosleep ./zig-out/bin/threadpool-l
 ```
 
 ## 练习 v2：动态线程池（懒创建 + 空闲退出）
+
+> 本仓库已含参考实现 `src/dynamic_pool.zig`，压测与行为演示跑 `zig build stress`。
+> 建议先自己写一遍再对照。
 
 目标：复刻 Go 运行时「任务先入队，线程不够才 clone；空闲太久的线程自动退出」。
 
